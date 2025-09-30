@@ -114,7 +114,13 @@ export const GameLobby: React.FC<GameLobbyProps> = ({
         try {
           // Generate questions for all players to share (host generates and shares)
           const { getRandomQuestions } = await import('../data/questions');
-          const gameQuestions = getRandomQuestions(10);
+
+          // Get question count from localStorage (set by host)
+          const storedQuestionCount = localStorage.getItem(`game_${gameSession.roomCode}_questionCount`);
+          const questionCount = storedQuestionCount ? parseInt(storedQuestionCount, 10) : 10;
+          console.log(`Generating ${questionCount} questions for game`);
+
+          const gameQuestions = getRandomQuestions(questionCount);
 
           // Store shared questions in localStorage for all players
           localStorage.setItem(`game_${gameSession.roomCode}_questions`, JSON.stringify(gameQuestions));
@@ -124,8 +130,38 @@ export const GameLobby: React.FC<GameLobbyProps> = ({
           localStorage.setItem(`game_${gameSession.roomCode}_started`, 'true');
           console.log('Game start signal set for room:', gameSession.roomCode);
 
+          // Broadcast questions to all tabs/windows using BroadcastChannel
+          try {
+            const channel = new BroadcastChannel(`trivia_${gameSession.roomCode}`);
+            const message = {
+              type: 'GAME_STARTED',
+              questions: gameQuestions,
+              roomCode: gameSession.roomCode,
+              timestamp: Date.now()
+            };
+
+            console.log('📡 Broadcasting questions via BroadcastChannel:', {
+              channel: `trivia_${gameSession.roomCode}`,
+              questionsCount: gameQuestions.length,
+              message
+            });
+
+            channel.postMessage(message);
+            console.log('✅ Questions broadcasted to all tabs via BroadcastChannel');
+
+            // Keep channel open briefly to ensure message delivery
+            setTimeout(() => {
+              channel.close();
+              console.log('🔒 BroadcastChannel closed after message delivery');
+            }, 1000);
+          } catch (error) {
+            console.warn('❌ BroadcastChannel not supported, falling back to localStorage events:', error);
+          }
+
           // Also dispatch custom event for same-tab communication
-          window.dispatchEvent(new CustomEvent(`gameStart_${gameSession.roomCode}`));
+          window.dispatchEvent(new CustomEvent(`gameStart_${gameSession.roomCode}`, {
+            detail: { questions: gameQuestions }
+          }));
           console.log('Game start custom event dispatched');
 
           setGameStarted(true);
@@ -156,7 +192,7 @@ export const GameLobby: React.FC<GameLobbyProps> = ({
     }
   }, [startError]);
 
-  // Watch for SessionStarted event (for non-host players)
+  // Watch for SessionStarted event (all players, including host for verification)
   useWatchContractEvent({
     address: TRIVIA_CONTRACT_ADDRESS as `0x${string}`,
     abi: TRIVIA_CONTRACT_ABI,
@@ -164,64 +200,137 @@ export const GameLobby: React.FC<GameLobbyProps> = ({
     args: {
       sessionId: BigInt(gameSession.sessionId),
     },
-    enabled: !gameSession.isHost, // Only watch if not the host
     onLogs(logs) {
       logs.forEach((log) => {
         const { sessionId, host, startTime } = log.args;
         console.log('Session started event detected:', { sessionId, host, startTime });
 
         if (sessionId?.toString() === gameSession.sessionId) {
-          console.log('Game started by host! Waiting for questions...');
-          toast.success('Game is starting! Get ready!', { duration: 3000 });
+          if (!gameSession.isHost) {
+            console.log('Game started by host! Waiting for questions...');
+            toast.success('Game is starting! Get ready!', { duration: 3000 });
 
-          // Poll for questions to be available (host needs time to store them)
-          let retryCount = 0;
-          const checkForQuestions = setInterval(() => {
-            const sharedQuestions = localStorage.getItem(`game_${gameSession.roomCode}_questions`);
-            if (sharedQuestions) {
-              console.log('Questions found! Starting game...');
-              clearInterval(checkForQuestions);
-              setTimeout(() => {
-                onStartGame();
-              }, 1500);
-            } else if (retryCount > 10) { // Try for 5 seconds
-              console.error('Questions not found after waiting');
-              clearInterval(checkForQuestions);
-              toast.error('Failed to load questions. Please refresh.');
+            // For non-host players, set a flag to indicate they're waiting
+            setGameStarted(true);
+
+            // Check if questions are already available (immediate check)
+            const checkForQuestionsImmediate = () => {
+              const sharedQuestions = localStorage.getItem(`game_${gameSession.roomCode}_questions`);
+              if (sharedQuestions) {
+                console.log('Questions found immediately! Starting game...');
+                setTimeout(() => {
+                  onStartGame();
+                }, 1500);
+                return true;
+              }
+              return false;
+            };
+
+            // First try immediate check
+            if (!checkForQuestionsImmediate()) {
+              // If not found immediately, set up a brief polling as fallback
+              console.log('Questions not found immediately, setting up brief polling...');
+              let retryCount = 0;
+              const quickPoll = setInterval(() => {
+                const sharedQuestions = localStorage.getItem(`game_${gameSession.roomCode}_questions`);
+                if (sharedQuestions) {
+                  console.log('Questions found via polling! Starting game...');
+                  clearInterval(quickPoll);
+                  setTimeout(() => {
+                    onStartGame();
+                  }, 1500);
+                } else if (retryCount > 8) { // Try for 4 seconds
+                  console.error('Questions not found after polling');
+                  clearInterval(quickPoll);
+                  toast.error('Failed to load questions. Please refresh.');
+                }
+                retryCount++;
+              }, 500);
             }
-            retryCount++;
-          }, 500);
+          }
         }
       });
     },
   });
 
-  // Fallback: localStorage synchronization for same-machine testing
+  // Listen for game start via multiple channels (cross-tab communication)
   useEffect(() => {
-    if (!gameSession.isHost) {
-      console.log('Setting up fallback localStorage detection for room:', gameSession.roomCode);
+    if (gameSession.isHost) return; // Host doesn't need to listen
 
-      // Listen for storage events (cross-tab)
-      const handleStorageChange = (e: StorageEvent) => {
-        if (e.key === `game_${gameSession.roomCode}_started` && e.newValue === 'true') {
-          const sharedQuestions = localStorage.getItem(`game_${gameSession.roomCode}_questions`);
-          if (sharedQuestions) {
-            console.log('Game start detected via storage event!');
-            toast.success('Game is starting! Get ready!', { duration: 3000 });
+    // BroadcastChannel listener (primary method for cross-tab)
+    let channel: BroadcastChannel | null = null;
+    try {
+      const channelName = `trivia_${gameSession.roomCode}`;
+      channel = new BroadcastChannel(channelName);
+
+      channel.onmessage = (event) => {
+        console.log('📨 BroadcastChannel message received:', {
+          channel: channelName,
+          data: event.data,
+          roomMatch: event.data.roomCode === gameSession.roomCode
+        });
+
+        if (event.data.type === 'GAME_STARTED' && event.data.roomCode === gameSession.roomCode) {
+          console.log('🎯 Valid GAME_STARTED message received via BroadcastChannel!');
+          console.log('📦 Questions received:', event.data.questions?.length || 0);
+
+          // Store questions locally
+          if (event.data.questions && event.data.questions.length > 0) {
+            localStorage.setItem(`game_${gameSession.roomCode}_questions`, JSON.stringify(event.data.questions));
+            console.log('💾 Questions stored in localStorage');
+
             setTimeout(() => {
+              console.log('🚀 Starting game via BroadcastChannel trigger');
               onStartGame();
             }, 1500);
+          } else {
+            console.error('❌ No questions in BroadcastChannel message');
           }
         }
       };
 
-      window.addEventListener('storage', handleStorageChange);
-
-      return () => {
-        window.removeEventListener('storage', handleStorageChange);
+      channel.onerror = (error) => {
+        console.error('❌ BroadcastChannel error:', error);
       };
+
+      console.log('🔊 BroadcastChannel listener set up for room:', gameSession.roomCode);
+    } catch (error) {
+      console.warn('❌ BroadcastChannel not supported, using fallback methods:', error);
     }
-  }, [gameSession.isHost, gameSession.roomCode, onStartGame]);
+
+    // Fallback: localStorage events (for different browsers)
+    const handleStorageChange = (event: StorageEvent) => {
+      if (event.key === `game_${gameSession.roomCode}_questions` && event.newValue) {
+        console.log('📦 Questions detected via storage event! Starting game...');
+        setTimeout(() => {
+          onStartGame();
+        }, 1500);
+      }
+    };
+    window.addEventListener('storage', handleStorageChange);
+
+    // Fallback: Custom events (same-tab communication)
+    const handleCustomGameStart = (event: any) => {
+      console.log('🎮 Game start detected via custom event!');
+      if (event.detail?.questions) {
+        // Store questions from custom event
+        localStorage.setItem(`game_${gameSession.roomCode}_questions`, JSON.stringify(event.detail.questions));
+      }
+      setTimeout(() => {
+        onStartGame();
+      }, 1500);
+    };
+    window.addEventListener(`gameStart_${gameSession.roomCode}`, handleCustomGameStart);
+
+    return () => {
+      if (channel) {
+        channel.close();
+      }
+      window.removeEventListener('storage', handleStorageChange);
+      window.removeEventListener(`gameStart_${gameSession.roomCode}`, handleCustomGameStart);
+    };
+  }, [gameSession.roomCode, gameSession.isHost, onStartGame]);
+
 
   const startGame = async () => {
     if (!gameSession.isHost) {

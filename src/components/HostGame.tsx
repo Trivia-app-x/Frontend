@@ -12,7 +12,8 @@ interface HostGameProps {
   onGameCreated: (
     sessionId: string,
     roomCode: string,
-    maxPlayers: number
+    maxPlayers: number,
+    questionCount: number
   ) => void;
   onBack: () => void;
 }
@@ -97,7 +98,7 @@ export const HostGame: React.FC<HostGameProps> = ({
             console.log("Session ID:", sessionId);
             console.log("Generated Room Code:", generatedRoomCode);
             console.log("Max Players:", maxPlayers);
-            onGameCreated(sessionId, generatedRoomCode, maxPlayers);
+            onGameCreated(sessionId, generatedRoomCode, maxPlayers, questionCount);
           }
         } else {
           // Fallback: use timestamp as session ID

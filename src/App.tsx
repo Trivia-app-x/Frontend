@@ -28,7 +28,10 @@ function App() {
   const { address: account, isConnected } = useAccount();
   const { disconnect } = useDisconnect();
 
-  const onGameCreated = (sessionId: string, roomCode: string, maxPlayers: number) => {
+  const onGameCreated = (sessionId: string, roomCode: string, maxPlayers: number, questionCount: number) => {
+    // Store question count in localStorage for game generation
+    localStorage.setItem(`game_${roomCode}_questionCount`, questionCount.toString());
+
     setGameSession({
       sessionId,
       roomCode,
