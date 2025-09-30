@@ -1,0 +1,1 @@
+export type GameState = 'home' | 'create' | 'join' | 'waiting' | 'playing' | 'ended';
