@@ -1,7 +1,8 @@
 import React, { useState, useEffect } from 'react';
 import toast from 'react-hot-toast';
-import { usePublicClient, useWatchContractEvent, useWriteContract, useWaitForTransactionReceipt } from 'wagmi';
+import { useWatchContractEvent, useWriteContract, useWaitForTransactionReceipt } from 'wagmi';
 import { TRIVIA_CONTRACT_ADDRESS, TRIVIA_CONTRACT_ABI } from '../contracts/TriviaChain';
+import { socketService } from '../services/socket';
 
 interface GameSession {
   sessionId: string;
@@ -34,7 +35,87 @@ export const GameLobby: React.FC<GameLobbyProps> = ({
 }) => {
   const [players, setPlayers] = useState<Player[]>([]);
   const [isStarting, setIsStarting] = useState(false);
-  const [gameStarted, setGameStarted] = useState(false);
+
+  // Socket integration: Join game room (run once on mount)
+  useEffect(() => {
+    console.log('🔌 GameLobby mounted, joining socket room');
+
+    // Join the socket room
+    if (!gameSession.isHost) {
+      // Non-host players join via socket (host already created the game)
+      socketService.joinGame(gameSession.sessionId, account);
+    }
+  }, [gameSession.sessionId, gameSession.isHost, account]);
+
+  // Socket integration: Set up real-time event listeners (run once on mount)
+  useEffect(() => {
+    console.log('🔌 Setting up socket event listeners');
+
+    // Listen for new players joining
+    const handlePlayerJoined = (data: { player: any; totalPlayers: number }) => {
+      console.log('📥 Player joined event:', data);
+
+      const { player, totalPlayers } = data;
+
+      // Update player count
+      onUpdatePlayerCount(totalPlayers);
+
+      // Add the new player to the list if not already there
+      setPlayers(prev => {
+        const playerExists = prev.some(p => p.address === player.address);
+        if (!playerExists) {
+          toast.success(`${player.displayName} joined the game!`);
+          return [...prev, {
+            address: player.address,
+            displayName: player.displayName,
+            isHost: false
+          }];
+        }
+        return prev;
+      });
+    };
+
+    // Listen for game started event (from host)
+    const handleGameStarted = (data: { questions: any[]; sessionId: string }) => {
+      console.log('📥 Game started event:', data);
+
+      const { questions, sessionId } = data;
+
+      if (sessionId === gameSession.sessionId) {
+        console.log(`✅ Game started! Received ${questions.length} questions`);
+
+        // Store questions in localStorage for gameplay
+        localStorage.setItem(`game_${gameSession.roomCode}_questions`, JSON.stringify(questions));
+
+        toast.success('Game is starting!', { duration: 2000 });
+
+        // Give a moment for the toast, then start
+        setTimeout(() => {
+          onStartGame();
+        }, 1500);
+      }
+    };
+
+    // Listen for errors
+    const handleError = (error: { message: string }) => {
+      console.error('❌ Socket error:', error.message);
+      toast.error(error.message);
+    };
+
+    // Attach listeners
+    socketService.onPlayerJoined(handlePlayerJoined);
+    socketService.onGameStarted(handleGameStarted);
+    socketService.onError(handleError);
+
+    // Cleanup on unmount
+    return () => {
+      console.log('🔌 GameLobby unmounting, cleaning up socket listeners');
+      socketService.offPlayerJoined();
+      socketService.offGameStarted();
+      socketService.offError();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // Only run once on mount
 
   // Blockchain hooks for starting session
   const { writeContract, data: startHash, isPending: isStartPending, error: startError } = useWriteContract();
@@ -109,7 +190,7 @@ export const GameLobby: React.FC<GameLobbyProps> = ({
     if (isStartSuccess && startHash) {
       toast.success('Game started on-chain!', { id: 'start-game' });
 
-      // Now proceed with local game start logic
+      // Now proceed with local game start logic and socket broadcast
       const proceedWithGameStart = async () => {
         try {
           // Generate questions for all players to share (host generates and shares)
@@ -118,60 +199,24 @@ export const GameLobby: React.FC<GameLobbyProps> = ({
           // Get question count from localStorage (set by host)
           const storedQuestionCount = localStorage.getItem(`game_${gameSession.roomCode}_questionCount`);
           const questionCount = storedQuestionCount ? parseInt(storedQuestionCount, 10) : 10;
-          console.log(`Generating ${questionCount} questions for game`);
+          console.log(`🎲 Generating ${questionCount} questions for game`);
 
           const gameQuestions = getRandomQuestions(questionCount);
 
-          // Store shared questions in localStorage for all players
+          // Store shared questions in localStorage for this player
           localStorage.setItem(`game_${gameSession.roomCode}_questions`, JSON.stringify(gameQuestions));
-          console.log('Shared questions stored for room:', gameSession.roomCode);
+          console.log('✅ Shared questions stored for room:', gameSession.roomCode);
 
-          // Signal to all players that the game is starting via localStorage
-          localStorage.setItem(`game_${gameSession.roomCode}_started`, 'true');
-          console.log('Game start signal set for room:', gameSession.roomCode);
+          // Emit socket event to start game for all players
+          console.log('📤 Emitting game:start via socket');
+          socketService.startGame(gameSession.sessionId, questionCount, 'mixed');
 
-          // Broadcast questions to all tabs/windows using BroadcastChannel
-          try {
-            const channel = new BroadcastChannel(`trivia_${gameSession.roomCode}`);
-            const message = {
-              type: 'GAME_STARTED',
-              questions: gameQuestions,
-              roomCode: gameSession.roomCode,
-              timestamp: Date.now()
-            };
+          toast.success('Game starting for all players!', { id: 'start-game' });
 
-            console.log('📡 Broadcasting questions via BroadcastChannel:', {
-              channel: `trivia_${gameSession.roomCode}`,
-              questionsCount: gameQuestions.length,
-              message
-            });
-
-            channel.postMessage(message);
-            console.log('✅ Questions broadcasted to all tabs via BroadcastChannel');
-
-            // Keep channel open briefly to ensure message delivery
-            setTimeout(() => {
-              channel.close();
-              console.log('🔒 BroadcastChannel closed after message delivery');
-            }, 1000);
-          } catch (error) {
-            console.warn('❌ BroadcastChannel not supported, falling back to localStorage events:', error);
-          }
-
-          // Also dispatch custom event for same-tab communication
-          window.dispatchEvent(new CustomEvent(`gameStart_${gameSession.roomCode}`, {
-            detail: { questions: gameQuestions }
-          }));
-          console.log('Game start custom event dispatched');
-
-          setGameStarted(true);
-
-          // Give players a moment to see the notification
+          // Give players a moment to see the notification, then transition
           setTimeout(() => {
-            // Clean up the start signal (but keep questions for gameplay)
-            localStorage.removeItem(`game_${gameSession.roomCode}_started`);
             onStartGame();
-          }, 2000);
+          }, 1500);
         } catch (error) {
           console.error('Error with local game start:', error);
           toast.error('Failed to start local game');
@@ -192,7 +237,7 @@ export const GameLobby: React.FC<GameLobbyProps> = ({
     }
   }, [startError]);
 
-  // Watch for SessionStarted event (all players, including host for verification)
+  // Watch for SessionStarted event (blockchain confirmation)
   useWatchContractEvent({
     address: TRIVIA_CONTRACT_ADDRESS as `0x${string}`,
     abi: TRIVIA_CONTRACT_ABI,
@@ -203,133 +248,15 @@ export const GameLobby: React.FC<GameLobbyProps> = ({
     onLogs(logs) {
       logs.forEach((log) => {
         const { sessionId, host, startTime } = log.args;
-        console.log('Session started event detected:', { sessionId, host, startTime });
+        console.log('📋 Blockchain SessionStarted event:', { sessionId, host, startTime });
 
+        // Just log for confirmation - socket handles the actual game start
         if (sessionId?.toString() === gameSession.sessionId) {
-          if (!gameSession.isHost) {
-            console.log('Game started by host! Waiting for questions...');
-            toast.success('Game is starting! Get ready!', { duration: 3000 });
-
-            // For non-host players, set a flag to indicate they're waiting
-            setGameStarted(true);
-
-            // Check if questions are already available (immediate check)
-            const checkForQuestionsImmediate = () => {
-              const sharedQuestions = localStorage.getItem(`game_${gameSession.roomCode}_questions`);
-              if (sharedQuestions) {
-                console.log('Questions found immediately! Starting game...');
-                setTimeout(() => {
-                  onStartGame();
-                }, 1500);
-                return true;
-              }
-              return false;
-            };
-
-            // First try immediate check
-            if (!checkForQuestionsImmediate()) {
-              // If not found immediately, set up a brief polling as fallback
-              console.log('Questions not found immediately, setting up brief polling...');
-              let retryCount = 0;
-              const quickPoll = setInterval(() => {
-                const sharedQuestions = localStorage.getItem(`game_${gameSession.roomCode}_questions`);
-                if (sharedQuestions) {
-                  console.log('Questions found via polling! Starting game...');
-                  clearInterval(quickPoll);
-                  setTimeout(() => {
-                    onStartGame();
-                  }, 1500);
-                } else if (retryCount > 8) { // Try for 4 seconds
-                  console.error('Questions not found after polling');
-                  clearInterval(quickPoll);
-                  toast.error('Failed to load questions. Please refresh.');
-                }
-                retryCount++;
-              }, 500);
-            }
-          }
+          console.log('✅ Blockchain confirmed game start');
         }
       });
     },
   });
-
-  // Listen for game start via multiple channels (cross-tab communication)
-  useEffect(() => {
-    if (gameSession.isHost) return; // Host doesn't need to listen
-
-    // BroadcastChannel listener (primary method for cross-tab)
-    let channel: BroadcastChannel | null = null;
-    try {
-      const channelName = `trivia_${gameSession.roomCode}`;
-      channel = new BroadcastChannel(channelName);
-
-      channel.onmessage = (event) => {
-        console.log('📨 BroadcastChannel message received:', {
-          channel: channelName,
-          data: event.data,
-          roomMatch: event.data.roomCode === gameSession.roomCode
-        });
-
-        if (event.data.type === 'GAME_STARTED' && event.data.roomCode === gameSession.roomCode) {
-          console.log('🎯 Valid GAME_STARTED message received via BroadcastChannel!');
-          console.log('📦 Questions received:', event.data.questions?.length || 0);
-
-          // Store questions locally
-          if (event.data.questions && event.data.questions.length > 0) {
-            localStorage.setItem(`game_${gameSession.roomCode}_questions`, JSON.stringify(event.data.questions));
-            console.log('💾 Questions stored in localStorage');
-
-            setTimeout(() => {
-              console.log('🚀 Starting game via BroadcastChannel trigger');
-              onStartGame();
-            }, 1500);
-          } else {
-            console.error('❌ No questions in BroadcastChannel message');
-          }
-        }
-      };
-
-      channel.onerror = (error) => {
-        console.error('❌ BroadcastChannel error:', error);
-      };
-
-      console.log('🔊 BroadcastChannel listener set up for room:', gameSession.roomCode);
-    } catch (error) {
-      console.warn('❌ BroadcastChannel not supported, using fallback methods:', error);
-    }
-
-    // Fallback: localStorage events (for different browsers)
-    const handleStorageChange = (event: StorageEvent) => {
-      if (event.key === `game_${gameSession.roomCode}_questions` && event.newValue) {
-        console.log('📦 Questions detected via storage event! Starting game...');
-        setTimeout(() => {
-          onStartGame();
-        }, 1500);
-      }
-    };
-    window.addEventListener('storage', handleStorageChange);
-
-    // Fallback: Custom events (same-tab communication)
-    const handleCustomGameStart = (event: any) => {
-      console.log('🎮 Game start detected via custom event!');
-      if (event.detail?.questions) {
-        // Store questions from custom event
-        localStorage.setItem(`game_${gameSession.roomCode}_questions`, JSON.stringify(event.detail.questions));
-      }
-      setTimeout(() => {
-        onStartGame();
-      }, 1500);
-    };
-    window.addEventListener(`gameStart_${gameSession.roomCode}`, handleCustomGameStart);
-
-    return () => {
-      if (channel) {
-        channel.close();
-      }
-      window.removeEventListener('storage', handleStorageChange);
-      window.removeEventListener(`gameStart_${gameSession.roomCode}`, handleCustomGameStart);
-    };
-  }, [gameSession.roomCode, gameSession.isHost, onStartGame]);
 
 
   const startGame = async () => {

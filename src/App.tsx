@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { Toaster } from 'react-hot-toast';
 import { useAccount, useDisconnect } from 'wagmi';
 import { ConnectButton } from '@rainbow-me/rainbowkit';
@@ -8,6 +8,7 @@ import { JoinGame } from './components/JoinGame';
 import { GameLobby } from './components/GameLobby';
 import { GamePlay } from './components/GamePlay';
 import { GameResults } from './components/GameResults';
+import { socketService } from './services/socket';
 import type { GameState } from './types';
 import './index.css';
 
@@ -27,6 +28,22 @@ function App() {
   // Wagmi hooks
   const { address: account, isConnected } = useAccount();
   const { disconnect } = useDisconnect();
+
+  // Initialize socket connection when user connects wallet
+  useEffect(() => {
+    if (isConnected && account) {
+      console.log('🔌 User connected, initializing socket...');
+      socketService.connect();
+    } else {
+      console.log('🔌 User disconnected, closing socket...');
+      socketService.disconnect();
+    }
+
+    // Cleanup on unmount
+    return () => {
+      socketService.removeAllListeners();
+    };
+  }, [isConnected, account]);
 
   const onGameCreated = (sessionId: string, roomCode: string, maxPlayers: number, questionCount: number) => {
     // Store question count in localStorage for game generation
@@ -53,7 +70,7 @@ function App() {
     setGameState('waiting');
   };
 
-  const handleBackToHome = () => {
+  const handleBackToHome = useCallback(() => {
     // Clean up localStorage when leaving game
     if (gameSession) {
       localStorage.removeItem(`game_${gameSession.roomCode}_questions`);
@@ -63,7 +80,20 @@ function App() {
     setGameState('home');
     setGameSession(null);
     setWinner('');
-  };
+  }, [gameSession]);
+
+  const handleStartGame = useCallback(() => {
+    setGameState('playing');
+  }, []);
+
+  const handleUpdatePlayerCount = useCallback((count: number) => {
+    setGameSession(prev => prev ? {...prev, playerCount: count} : null);
+  }, []);
+
+  const handleGameEnd = useCallback((winner: string) => {
+    setWinner(winner);
+    setGameState('ended');
+  }, []);
 
   const renderContent = () => {
     if (!isConnected || !account) {
@@ -109,11 +139,9 @@ function App() {
           <GameLobby
             account={account}
             gameSession={gameSession!}
-            onStartGame={() => setGameState('playing')}
+            onStartGame={handleStartGame}
             onBack={handleBackToHome}
-            onUpdatePlayerCount={(count) =>
-              setGameSession(prev => prev ? {...prev, playerCount: count} : null)
-            }
+            onUpdatePlayerCount={handleUpdatePlayerCount}
           />
         );
 
@@ -122,10 +150,7 @@ function App() {
           <GamePlay
             account={account}
             gameSession={gameSession!}
-            onGameEnd={(winner) => {
-              setWinner(winner);
-              setGameState('ended');
-            }}
+            onGameEnd={handleGameEnd}
             onBack={handleBackToHome}
           />
         );

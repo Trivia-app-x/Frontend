@@ -1,37 +1,10 @@
 import { useState, useEffect } from 'react';
 import toast from 'react-hot-toast';
-import { useWriteContract, useWaitForTransactionReceipt, usePublicClient } from 'wagmi';
-import { keccak256, stringToHex, encodeFunctionData } from 'viem';
+import { useWriteContract, useWaitForTransactionReceipt } from 'wagmi';
 import type { Question } from '../data/questions';
 import { getRandomQuestions } from '../data/questions';
 import { TRIVIA_CONTRACT_ADDRESS, TRIVIA_CONTRACT_ABI } from '../contracts/TriviaChain';
-
-// Arbitrum Sepolia Multicall3 contract address
-const MULTICALL3_ADDRESS = '0xcA11bde05977b3631167028862bE2a173976CA11';
-
-// Multicall3 ABI (only the aggregate function we need)
-const MULTICALL3_ABI = [
-  {
-    inputs: [
-      {
-        components: [
-          { internalType: 'address', name: 'target', type: 'address' },
-          { internalType: 'bytes', name: 'callData', type: 'bytes' }
-        ],
-        internalType: 'struct Multicall3.Call[]',
-        name: 'calls',
-        type: 'tuple[]'
-      }
-    ],
-    name: 'aggregate',
-    outputs: [
-      { internalType: 'uint256', name: 'blockNumber', type: 'uint256' },
-      { internalType: 'bytes[]', name: 'returnData', type: 'bytes[]' }
-    ],
-    stateMutability: 'payable',
-    type: 'function'
-  }
-] as const;
+import { socketService } from '../services/socket';
 
 interface GameSession {
   sessionId: string;
@@ -70,11 +43,14 @@ export const GamePlay: React.FC<GamePlayProps> = ({
     timeTaken: number;
   }[]>([]);
   const [questionStartTime, setQuestionStartTime] = useState<number>(Date.now());
+  const [gameStartTime, setGameStartTime] = useState<number | null>(null);
+  const [totalGameTime, setTotalGameTime] = useState<number>(0);
+  const [hasAutoSubmitted, setHasAutoSubmitted] = useState(false);
 
-  // Blockchain hooks for multicall submissions (individual submissions removed)
-  const { writeContract: writeMulticall, data: multicallHash, isPending: isMulticallPending, error: multicallError } = useWriteContract();
-  const { isLoading: isMulticallConfirming, isSuccess: isMulticallSuccess } = useWaitForTransactionReceipt({
-    hash: multicallHash,
+  // Blockchain hooks for final score submission
+  const { writeContract: writeScore, data: scoreHash, isPending: isScorePending, error: scoreError } = useWriteContract();
+  const { isLoading: isScoreConfirming, isSuccess: isScoreSuccess } = useWaitForTransactionReceipt({
+    hash: scoreHash,
   });
 
   // Blockchain hooks for ending session
@@ -82,9 +58,6 @@ export const GamePlay: React.FC<GamePlayProps> = ({
   const { isLoading: isEndConfirming, isSuccess: isEndSuccess } = useWaitForTransactionReceipt({
     hash: endHash,
   });
-
-  // Public client for multicall
-  const publicClient = usePublicClient();
 
   // Initialize questions when component mounts
   useEffect(() => {
@@ -127,8 +100,58 @@ export const GamePlay: React.FC<GamePlayProps> = ({
       const firstQuestion = questions[0];
       setTimeLeft(firstQuestion.timeLimit);
       setQuestionStartTime(Date.now()); // Set start time for first question
+      setGameStartTime(Date.now()); // Set start time for entire game
+
+      // Calculate total game time (sum of all question time limits)
+      const totalTime = questions.reduce((sum, q) => sum + (q.timeLimit || 30), 0);
+      setTotalGameTime(totalTime);
+      console.log(`🕐 Total game time: ${totalTime} seconds for ${questions.length} questions`);
     }
   }, [questions]);
+
+  // Socket integration: Listen for real-time gameplay events
+  useEffect(() => {
+    console.log('🔌 GamePlay: Setting up socket listeners');
+
+    // Listen for other players submitting answers (for live leaderboard)
+    socketService.onAnswerSubmitted((data) => {
+      const { playerSocketId, isCorrect, questionIndex, timeTaken } = data;
+
+      console.log('📥 Answer submitted by another player:', {
+        playerSocketId,
+        isCorrect,
+        questionIndex,
+        timeTaken
+      });
+
+      // You could update a live leaderboard here
+      // For now, just show a notification
+      if (isCorrect) {
+        toast.success(`Another player got question ${questionIndex + 1} correct!`, {
+          duration: 2000,
+          icon: '🎯'
+        });
+      }
+    });
+
+    // Listen for game ended event from host
+    socketService.onGameEnded((data) => {
+      console.log('📥 Game ended event received:', data);
+      toast.info('Host has ended the game!');
+
+      // Trigger local end game
+      setTimeout(() => {
+        localEndGame();
+      }, 1000);
+    });
+
+    // Cleanup listeners on unmount
+    return () => {
+      console.log('🔌 GamePlay: Cleaning up socket listeners');
+      socketService.offAnswerSubmitted();
+      socketService.offGameEnded();
+    };
+  }, [gameSession.sessionId]);
 
   // Timer for questions - only run when actively playing, not in review mode
   useEffect(() => {
@@ -140,33 +163,86 @@ export const GamePlay: React.FC<GamePlayProps> = ({
     }
   }, [timeLeft, gamePhase, isSubmitting]);
 
-  // Handle multicall transaction states
+  // Total game timer - monitors entire game duration
   useEffect(() => {
-    if (isMulticallPending) {
-      toast.loading('Waiting for wallet confirmation (Multicall)...', { id: 'batch-submit' });
+    if (gameStartTime && totalGameTime > 0 && gamePhase !== 'ended') {
+      const checkTotalTime = setInterval(() => {
+        const elapsedSeconds = Math.floor((Date.now() - gameStartTime) / 1000);
+        const remainingTime = totalGameTime - elapsedSeconds;
+
+        if (remainingTime <= 0 && gamePhase !== 'review' && gamePhase !== 'ended') {
+          console.log('⏰ Total game time expired! Auto-transitioning to review...');
+          toast.info('Time\'s up! Moving to review...', { duration: 3000 });
+
+          // Mark all unanswered questions as missed
+          const unansweredQuestions = questions
+            .map((_, index) => index)
+            .filter(index => !playerAnswers.some(a => a.questionIndex === index));
+
+          if (unansweredQuestions.length > 0) {
+            console.log(`📝 Marking ${unansweredQuestions.length} unanswered questions as missed`);
+            setPlayerAnswers(prev => [
+              ...prev,
+              ...unansweredQuestions.map(index => ({
+                questionIndex: index,
+                selectedAnswer: -1,
+                isCorrect: false,
+                pointsEarned: 0,
+                timeTaken: 0
+              }))
+            ]);
+          }
+
+          setGamePhase('review');
+        }
+      }, 1000);
+
+      return () => clearInterval(checkTotalTime);
     }
-  }, [isMulticallPending]);
+  }, [gameStartTime, totalGameTime, gamePhase, questions, playerAnswers]);
+
+  // Auto-submit final score after review delay
+  useEffect(() => {
+    if (gamePhase === 'review' && !hasAutoSubmitted && playerAnswers.length > 0) {
+      console.log('📝 In review phase, starting auto-submit countdown...');
+      toast.info('Submitting your score in 5 seconds...', { duration: 5000, id: 'auto-submit-info' });
+
+      const autoSubmitTimer = setTimeout(() => {
+        console.log('⚡ Auto-submitting final score...');
+        setHasAutoSubmitted(true);
+        submitAllAnswersBatch();
+      }, 5000); // 5 second delay
+
+      return () => clearTimeout(autoSubmitTimer);
+    }
+  }, [gamePhase, hasAutoSubmitted, playerAnswers]);
+
+  // Handle final score transaction states
+  useEffect(() => {
+    if (isScorePending) {
+      toast.loading('Waiting for wallet confirmation...', { id: 'batch-submit' });
+    }
+  }, [isScorePending]);
 
   useEffect(() => {
-    if (isMulticallConfirming) {
-      toast.loading('Submitting all answers on-chain...', { id: 'batch-submit' });
+    if (isScoreConfirming) {
+      toast.loading('Submitting final score on-chain...', { id: 'batch-submit' });
     }
-  }, [isMulticallConfirming]);
+  }, [isScoreConfirming]);
 
   useEffect(() => {
-    if (isMulticallSuccess && multicallHash) {
-      const answerCount = playerAnswers.length;
-      toast.success(`🎉 All ${answerCount} answers submitted in 1 transaction!`, { id: 'batch-submit' });
-      console.log(`✅ Multicall successful! Hash: ${multicallHash}`);
+    if (isScoreSuccess && scoreHash) {
+      toast.success(`🎉 Final score submitted successfully!`, { id: 'batch-submit', duration: 3000 });
+      console.log(`✅ Final score transaction hash: ${scoreHash}`);
     }
-  }, [isMulticallSuccess, multicallHash, playerAnswers.length]);
+  }, [isScoreSuccess, scoreHash]);
 
   useEffect(() => {
-    if (multicallError) {
-      console.error('❌ Multicall transaction error:', multicallError);
-      toast.error('Failed to submit answers via multicall', { id: 'batch-submit' });
+    if (scoreError) {
+      console.error('❌ Score submission error:', scoreError);
+      toast.error('Failed to submit final score', { id: 'batch-submit' });
     }
-  }, [multicallError]);
+  }, [scoreError]);
 
   // Handle endSession transaction states
   useEffect(() => {
@@ -256,6 +332,10 @@ export const GamePlay: React.FC<GamePlayProps> = ({
       const timeTaken = Date.now() - questionStartTime;
 
       console.log(`🎯 Answer ${isCorrect ? 'CORRECT' : 'INCORRECT'} - Points: ${pointsEarned}`);
+
+      // Emit socket event for real-time updates
+      console.log('📤 Emitting answer:submit to socket');
+      socketService.submitAnswer(gameSession.sessionId, currentQuestionIndex, selectedAnswer, timeTaken);
 
       // Store this answer for batch submission later (update existing or add new)
       setPlayerAnswers(prev => {
@@ -373,42 +453,10 @@ export const GamePlay: React.FC<GamePlayProps> = ({
   };
 
   const endGame = async () => {
-    try {
-      console.log('🏁 Starting game end process...');
-
-      // First, submit all answers in batch to blockchain
-      await submitAllAnswersBatch();
-
-      // Then only host should call endSession on blockchain
-      if (gameSession.isHost) {
-        try {
-          console.log('🎯 Host ending game on-chain...');
-          toast.loading('Ending game on-chain...', { id: 'end-game' });
-
-          // Call blockchain endSession function
-          writeEndSession({
-            address: TRIVIA_CONTRACT_ADDRESS as `0x${string}`,
-            abi: TRIVIA_CONTRACT_ABI,
-            functionName: "endSession",
-            args: [BigInt(gameSession.sessionId)],
-          });
-
-        } catch (error: any) {
-          console.error('❌ Error ending game on blockchain:', error);
-          toast.error('Failed to end game on-chain', { id: 'end-game' });
-          // Fallback to local end
-          localEndGame();
-        }
-      } else {
-        // Non-host players just end locally
-        console.log('👤 Non-host player ending game locally...');
-        localEndGame();
-      }
-    } catch (error: any) {
-      console.error('💥 Critical error in endGame:', error);
-      toast.error('Error ending game, falling back to local end', { id: 'end-game' });
-      localEndGame();
-    }
+    // This function is no longer used with the new auto-submit flow
+    // Keeping it for backwards compatibility with socket events
+    console.log('🏁 endGame called - transitioning to review...');
+    setGamePhase('review');
   };
 
   const submitAllAnswersBatch = async () => {
@@ -418,86 +466,31 @@ export const GamePlay: React.FC<GamePlayProps> = ({
     }
 
     try {
-      toast.loading(`Preparing multicall with ${playerAnswers.length} answers...`, { id: 'batch-submit' });
+      // Calculate total score and correct answers count
+      const totalScore = playerAnswers.reduce((sum, answer) => sum + answer.pointsEarned, 0);
+      const correctCount = playerAnswers.filter(answer => answer.isCorrect).length;
 
-      console.log(`🚀 Using Multicall3 to submit ${playerAnswers.length} answers in a single transaction!`);
+      console.log(`🎯 Submitting final score: ${totalScore} points, ${correctCount}/${playerAnswers.length} correct`);
+      toast.loading('Submitting your final score...', { id: 'batch-submit' });
 
-      // Prepare all submitAnswer calls for multicall
-      const calls = playerAnswers.map((answer) => {
-        const question = questions[answer.questionIndex];
-
-        // Handle timeout answers (selectedAnswer: -1)
-        let playerAnswerText: string;
-        if (answer.selectedAnswer === -1) {
-          playerAnswerText = "NO_ANSWER_TIMEOUT";
-        } else {
-          playerAnswerText = question.options[answer.selectedAnswer];
-        }
-
-        const correctAnswerText = question.options[question.correctAnswer];
-        const answerHash = keccak256(stringToHex(playerAnswerText));
-        const correctAnswerHash = keccak256(stringToHex(correctAnswerText));
-
-        // Encode the submitAnswer function call
-        const callData = encodeFunctionData({
-          abi: TRIVIA_CONTRACT_ABI,
-          functionName: 'submitAnswer',
-          args: [
-            BigInt(gameSession.sessionId),
-            BigInt(answer.questionIndex),
-            answerHash,
-            correctAnswerHash,
-            question.difficulty
-          ],
-        });
-
-        return {
-          target: TRIVIA_CONTRACT_ADDRESS as `0x${string}`,
-          callData: callData,
-        };
+      // Submit using the new submitFinalScore function (single transaction!)
+      writeScore({
+        address: TRIVIA_CONTRACT_ADDRESS as `0x${string}`,
+        abi: TRIVIA_CONTRACT_ABI,
+        functionName: 'submitFinalScore',
+        args: [
+          BigInt(gameSession.sessionId),
+          BigInt(totalScore),
+          BigInt(correctCount),
+        ],
       });
 
-      console.log(`📦 Multicall prepared with ${calls.length} encoded function calls`);
-      toast.loading('Executing multicall (single transaction)...', { id: 'batch-submit' });
-
-      // Execute multicall with a single transaction
-      await new Promise<void>((resolve, reject) => {
-        const timeoutId = setTimeout(() => {
-          reject(new Error('Multicall transaction timed out'));
-        }, 60000); // 1 minute timeout
-
-        try {
-          writeMulticall({
-            address: MULTICALL3_ADDRESS as `0x${string}`,
-            abi: MULTICALL3_ABI,
-            functionName: 'aggregate',
-            args: [calls],
-          });
-
-          // Give some time for the transaction to be initiated
-          setTimeout(() => {
-            clearTimeout(timeoutId);
-            resolve();
-          }, 3000);
-
-        } catch (error) {
-          clearTimeout(timeoutId);
-          reject(error);
-        }
-      });
-
-      toast.success(`🎉 All ${playerAnswers.length} answers submitted in 1 transaction via Multicall3!`, { id: 'batch-submit' });
-      console.log(`✅ Multicall successful! Submitted ${playerAnswers.length} answers with single wallet confirmation.`);
+      toast.success(`✅ Final score submitted: ${totalScore} points!`, { id: 'batch-submit' });
+      console.log(`✅ Final score submitted successfully with 1 transaction!`);
 
     } catch (error: any) {
-      console.error('❌ Multicall submission failed:', error);
-      toast.error(`Failed to submit answers via multicall: ${error.message}`, { id: 'batch-submit' });
-
-      // Fallback: inform user about the limitation
-      toast.error('Falling back to individual transactions...', { duration: 3000 });
-
-      // Could implement individual submission fallback here if needed
-      console.log('💡 Consider implementing individual submission fallback for better UX');
+      console.error('❌ Final score submission failed:', error);
+      toast.error(`Failed to submit final score: ${error.message}`, { id: 'batch-submit' });
     }
   };
 
@@ -652,7 +645,21 @@ export const GamePlay: React.FC<GamePlayProps> = ({
       {gamePhase === 'review' && (
         <div className="bg-gray-900/80 backdrop-blur-lg rounded-2xl p-8 text-center border border-white/10">
           <h2 className="text-3xl font-bold text-white mb-6">📝 Review Your Answers</h2>
-          <p className="text-gray-300 mb-8">You've answered all questions! You can go back to change any answer or finish the game.</p>
+
+          {!hasAutoSubmitted ? (
+            <p className="text-gray-300 mb-4">
+              Review your answers below. Your final score will be submitted automatically in a few seconds...
+            </p>
+          ) : isScoreSuccess ? (
+            <div className="mb-6">
+              <p className="text-green-400 mb-2">✅ Score submitted successfully!</p>
+              {gameSession.isHost && (
+                <p className="text-yellow-400">As the host, you can now end the session for all players.</p>
+              )}
+            </div>
+          ) : (
+            <p className="text-yellow-400 mb-4">⏳ Submitting your final score...</p>
+          )}
 
           <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-8">
             {questions.map((_, index) => {
@@ -691,27 +698,68 @@ export const GamePlay: React.FC<GamePlayProps> = ({
             })}
           </div>
 
-          <div className="flex gap-4 justify-center">
-            <button
-              onClick={() => {
-                console.log('Starting review from question 1');
-                setCurrentQuestionIndex(0);
-                setGamePhase('playing');
-                setTimeLeft(questions[0].timeLimit || 30);
-                setQuestionStartTime(Date.now());
-                setIsSubmitting(false); // Reset submitting state
-                setSelectedAnswer(playerAnswers.find(a => a.questionIndex === 0)?.selectedAnswer ?? null);
-              }}
-              className="bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-700 hover:to-blue-800 text-white font-bold py-3 px-6 rounded-xl transition-all transform hover:scale-105 shadow-lg"
-            >
-              📚 Review Questions
-            </button>
-            <button
-              onClick={endGame}
-              className="bg-gradient-to-r from-green-600 to-emerald-700 hover:from-green-700 hover:to-emerald-800 text-white font-bold py-3 px-6 rounded-xl transition-all transform hover:scale-105 shadow-lg"
-            >
-              🏁 Finish Game
-            </button>
+          <div className="flex gap-4 justify-center flex-wrap">
+            {!hasAutoSubmitted && (
+              <>
+                <button
+                  onClick={() => {
+                    console.log('Starting review from question 1');
+                    setCurrentQuestionIndex(0);
+                    setGamePhase('playing');
+                    setTimeLeft(questions[0].timeLimit || 30);
+                    setQuestionStartTime(Date.now());
+                    setIsSubmitting(false); // Reset submitting state
+                    setSelectedAnswer(playerAnswers.find(a => a.questionIndex === 0)?.selectedAnswer ?? null);
+                  }}
+                  className="bg-gradient-to-r from-blue-600 to-blue-700 hover:from-blue-700 hover:to-blue-800 text-white font-bold py-3 px-6 rounded-xl transition-all transform hover:scale-105 shadow-lg"
+                >
+                  📚 Review Questions
+                </button>
+                <button
+                  onClick={() => {
+                    setHasAutoSubmitted(true);
+                    submitAllAnswersBatch();
+                  }}
+                  className="bg-gradient-to-r from-green-600 to-emerald-700 hover:from-green-700 hover:to-emerald-800 text-white font-bold py-3 px-6 rounded-xl transition-all transform hover:scale-105 shadow-lg"
+                >
+                  🏁 Submit Now
+                </button>
+              </>
+            )}
+
+            {hasAutoSubmitted && isScoreSuccess && gameSession.isHost && (
+              <button
+                onClick={() => {
+                  console.log('🎯 Host ending session on-chain...');
+                  writeEndSession({
+                    address: TRIVIA_CONTRACT_ADDRESS as `0x${string}`,
+                    abi: TRIVIA_CONTRACT_ABI,
+                    functionName: "endSession",
+                    args: [BigInt(gameSession.sessionId)],
+                  });
+                  // Also emit socket event
+                  socketService.endGame(gameSession.sessionId);
+                }}
+                disabled={isEndPending || isEndConfirming}
+                className="bg-gradient-to-r from-red-600 to-orange-600 hover:from-red-700 hover:to-orange-700 text-white font-bold py-4 px-8 rounded-xl text-lg transition-all transform hover:scale-105 shadow-lg disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {isEndPending || isEndConfirming ? (
+                  <span className="flex items-center">
+                    <svg className="animate-spin -ml-1 mr-3 h-5 w-5" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
+                    </svg>
+                    Ending Session...
+                  </span>
+                ) : (
+                  '🔚 End Session (Host Only)'
+                )}
+              </button>
+            )}
+
+            {hasAutoSubmitted && isScoreSuccess && !gameSession.isHost && (
+              <p className="text-gray-400 text-sm">Waiting for host to end the session...</p>
+            )}
           </div>
         </div>
       )}

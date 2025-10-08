@@ -3,6 +3,7 @@ import toast from 'react-hot-toast';
 import { useWriteContract, useWaitForTransactionReceipt } from 'wagmi';
 import { stringToHex } from 'viem';
 import { TRIVIA_CONTRACT_ADDRESS, TRIVIA_CONTRACT_ABI } from '../contracts/TriviaChain';
+import { socketService } from '../services/socket';
 
 interface JoinGameProps {
   account: string;
@@ -18,13 +19,14 @@ export const JoinGame: React.FC<JoinGameProps> = ({
   const [roomCode, setRoomCode] = useState('');
   const [sessionId, setSessionId] = useState('');
   const [enteredRoomCode, setEnteredRoomCode] = useState('');
+  const [isFetchingSession, setIsFetchingSession] = useState(false);
 
   const { writeContract, data: hash, isPending, error } = useWriteContract();
   const { isLoading: isConfirming, isSuccess } = useWaitForTransactionReceipt({
     hash,
   });
 
-  const joinGame = () => {
+  const joinGame = async () => {
     if (!roomCode.trim()) {
       toast.error('Please enter a room code');
       return;
@@ -35,50 +37,100 @@ export const JoinGame: React.FC<JoinGameProps> = ({
       return;
     }
 
-    if (!sessionId.trim()) {
-      toast.error('Please enter a session ID');
-      return;
+    setEnteredRoomCode(roomCode.toUpperCase());
+    setIsFetchingSession(true);
+
+    try {
+      // Step 1: Fetch session ID from backend using room code
+      toast.loading('Finding game session...', { id: 'fetch-session' });
+
+      const response = await fetch(`${import.meta.env.VITE_BACKEND_URL || "http://localhost:3001"}/api/game/room/${roomCode.toUpperCase()}`);
+
+      if (!response.ok) {
+        throw new Error('Game not found with this room code');
+      }
+
+      const data = await response.json();
+
+      if (!data.success || !data.sessionId) {
+        throw new Error('Invalid game session');
+      }
+
+      const fetchedSessionId = data.sessionId;
+      setSessionId(fetchedSessionId);
+
+      toast.success('Game found!', { id: 'fetch-session' });
+      console.log('📋 Fetched session ID:', fetchedSessionId);
+
+      // Step 2: Join on blockchain
+      toast.loading('Joining game on-chain...', { id: 'join-blockchain' });
+
+      // Convert room code and display name to bytes32
+      const roomCodeHex = stringToHex(roomCode.toUpperCase(), { size: 32 });
+      const displayNameHex = stringToHex(`Player_${account.slice(0, 6)}`, { size: 32 });
+
+      // Call the smart contract to join the session
+      writeContract({
+        address: TRIVIA_CONTRACT_ADDRESS as `0x${string}`,
+        abi: TRIVIA_CONTRACT_ABI,
+        functionName: "joinSession",
+        args: [BigInt(fetchedSessionId), roomCodeHex, displayNameHex],
+      });
+
+    } catch (error: any) {
+      console.error('❌ Error joining game:', error);
+      toast.error(error.message || 'Failed to find game', { id: 'fetch-session' });
+      setIsFetchingSession(false);
     }
-
-    setEnteredRoomCode(roomCode);
-
-    // Convert room code and display name to bytes32
-    const roomCodeHex = stringToHex(roomCode.toUpperCase(), { size: 32 });
-    const displayNameHex = stringToHex(`Player_${account.slice(0, 6)}`, { size: 32 });
-
-    // Call the smart contract to join the session
-    writeContract({
-      address: TRIVIA_CONTRACT_ADDRESS as `0x${string}`,
-      abi: TRIVIA_CONTRACT_ABI,
-      functionName: "joinSession",
-      args: [BigInt(sessionId), roomCodeHex, displayNameHex],
-    });
   };
 
   // Handle transaction states
   React.useEffect(() => {
     if (isPending) {
-      toast.loading("Waiting for wallet confirmation...", { id: "join-game" });
+      toast.loading("Waiting for wallet confirmation...", { id: "join-blockchain" });
     }
   }, [isPending]);
 
   React.useEffect(() => {
     if (isConfirming) {
-      toast.loading("Joining game on-chain...", { id: "join-game" });
+      toast.loading("Joining game on-chain...", { id: "join-blockchain" });
     }
   }, [isConfirming]);
 
   React.useEffect(() => {
-    if (isSuccess && hash) {
-      toast.success('Joined game successfully!', { id: "join-game" });
-      onGameJoined(sessionId, enteredRoomCode.toUpperCase());
+    if (isSuccess && hash && sessionId) {
+      toast.success('Joined game on-chain!', { id: "join-blockchain", duration: 2000 });
+
+      // Step 3: Emit socket event to join the game room
+      console.log('📤 Emitting socket event game:join');
+      socketService.joinGame(sessionId, account);
+
+      toast.success('Successfully joined the game!', { duration: 3000 });
+      setIsFetchingSession(false);
+
+      // Dismiss any lingering toasts before navigating
+      setTimeout(() => {
+        toast.dismiss();
+        // Navigate to game lobby
+        onGameJoined(sessionId, enteredRoomCode.toUpperCase());
+      }, 500);
     }
-  }, [isSuccess, hash, sessionId, enteredRoomCode, onGameJoined]);
+  }, [isSuccess, hash, sessionId, enteredRoomCode, account, onGameJoined]);
+
+  // Cleanup effect: dismiss toasts on unmount
+  React.useEffect(() => {
+    return () => {
+      toast.dismiss('join-blockchain');
+      toast.dismiss('fetch-session');
+      toast.dismiss('join-complete');
+    };
+  }, []);
 
   React.useEffect(() => {
     if (error) {
       console.error("Transaction error:", error);
-      toast.error(error.message || "Failed to join game", { id: "join-game" });
+      toast.error(error.message || "Failed to join game", { id: "join-blockchain" });
+      setIsFetchingSession(false);
     }
   }, [error]);
 
@@ -88,8 +140,8 @@ export const JoinGame: React.FC<JoinGameProps> = ({
     setRoomCode(filtered.toUpperCase());
   };
 
-  const handleKeyPress = (e: React.KeyboardEvent) => {
-    if (e.key === 'Enter' && roomCode.length === 6 && sessionId.trim() && !isPending && !isConfirming) {
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' && roomCode.length === 6 && !isPending && !isConfirming && !isFetchingSession) {
       joinGame();
     }
   };
@@ -126,32 +178,14 @@ export const JoinGame: React.FC<JoinGameProps> = ({
                 type="text"
                 value={roomCode}
                 onChange={(e) => handleInputChange(e.target.value)}
-                onKeyPress={handleKeyPress}
+                onKeyDown={handleKeyDown}
                 placeholder="ABC123"
                 className="w-full bg-white/10 border border-white/20 rounded-xl px-6 py-4 text-white placeholder-gray-400 text-center text-2xl font-mono font-bold tracking-widest focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                 maxLength={6}
-                disabled={isPending || isConfirming}
+                disabled={isPending || isConfirming || isFetchingSession}
               />
               <p className="text-gray-400 text-xs mt-2 text-center">
                 Enter the 6-character code from your host
-              </p>
-            </div>
-
-            {/* Session ID Input */}
-            <div>
-              <label className="block text-white text-sm font-medium mb-3">
-                Session ID
-              </label>
-              <input
-                type="text"
-                value={sessionId}
-                onChange={(e) => setSessionId(e.target.value)}
-                placeholder="Enter session ID"
-                className="w-full bg-white/10 border border-white/20 rounded-lg px-4 py-2 text-white placeholder-gray-400 text-center focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                disabled={isPending || isConfirming}
-              />
-              <p className="text-gray-400 text-xs mt-2 text-center">
-                Ask your host for the session ID
               </p>
             </div>
 
@@ -188,20 +222,20 @@ export const JoinGame: React.FC<JoinGameProps> = ({
             {/* Join Button */}
             <button
               onClick={joinGame}
-              disabled={isPending || isConfirming || roomCode.length !== 6 || !sessionId.trim()}
+              disabled={isPending || isConfirming || isFetchingSession || roomCode.length !== 6}
               className={`w-full py-4 px-6 rounded-xl font-semibold text-lg transition-all duration-200 ${
-                isPending || isConfirming || roomCode.length !== 6 || !sessionId.trim()
+                isPending || isConfirming || isFetchingSession || roomCode.length !== 6
                   ? 'bg-gray-700 cursor-not-allowed text-gray-400'
                   : 'bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-700 hover:to-indigo-700 text-white transform hover:scale-[1.02] active:scale-[0.98]'
               }`}
             >
-              {isPending || isConfirming ? (
+              {isFetchingSession || isPending || isConfirming ? (
                 <span className="flex items-center justify-center">
                   <svg className="animate-spin -ml-1 mr-3 h-5 w-5" fill="none" viewBox="0 0 24 24">
                     <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
                     <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
                   </svg>
-                  {isPending ? 'Confirming...' : 'Joining...'}
+                  {isFetchingSession ? 'Finding game...' : isPending ? 'Confirming...' : 'Joining...'}
                 </span>
               ) : (
                 'Join Game'

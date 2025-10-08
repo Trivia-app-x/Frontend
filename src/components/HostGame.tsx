@@ -69,7 +69,44 @@ export const HostGame: React.FC<HostGameProps> = ({
 
   React.useEffect(() => {
     if (isSuccess && hash && generatedRoomCode && receipt) {
-      toast.success("Game created successfully!", { id: "create-game" });
+      toast.success("Game created on-chain!", { id: "create-game" });
+
+      const registerGameWithBackend = async (sessionId: string) => {
+        try {
+          toast.loading("Registering game with backend...", { id: "backend-register" });
+
+          const response = await fetch(`${import.meta.env.VITE_BACKEND_URL || "http://localhost:3001"}/api/game/create`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              sessionId,
+              roomCode: generatedRoomCode,
+              host: account,
+              maxPlayers,
+              questionDuration: timeLimit,
+            }),
+          });
+
+          if (!response.ok) {
+            throw new Error("Failed to register game with backend");
+          }
+
+          const data = await response.json();
+          console.log("✅ Game registered with backend:", data);
+          toast.success("Game created successfully!", { id: "backend-register" });
+
+          // Now proceed to lobby
+          onGameCreated(sessionId, generatedRoomCode, maxPlayers, questionCount);
+        } catch (error) {
+          console.error("❌ Error registering game with backend:", error);
+          toast.error("Failed to register with backend, but you can still play", { id: "backend-register" });
+
+          // Still allow game creation even if backend registration fails
+          onGameCreated(sessionId, generatedRoomCode, maxPlayers, questionCount);
+        }
+      };
 
       try {
         // Extract session ID from SessionCreated event
@@ -95,24 +132,27 @@ export const HostGame: React.FC<HostGameProps> = ({
 
           if (decoded.eventName === 'SessionCreated') {
             const sessionId = decoded.args.sessionId.toString();
-            console.log("Session ID:", sessionId);
-            console.log("Generated Room Code:", generatedRoomCode);
-            console.log("Max Players:", maxPlayers);
-            onGameCreated(sessionId, generatedRoomCode, maxPlayers, questionCount);
+            console.log("📋 Session ID:", sessionId);
+            console.log("🎲 Room Code:", generatedRoomCode);
+            console.log("👥 Max Players:", maxPlayers);
+
+            // Register with backend
+            registerGameWithBackend(sessionId);
           }
         } else {
           // Fallback: use timestamp as session ID
           const sessionId = Date.now().toString();
-          onGameCreated(sessionId, generatedRoomCode, maxPlayers);
+          console.log("⚠️ Using fallback session ID:", sessionId);
+          registerGameWithBackend(sessionId);
         }
       } catch (error) {
-        console.error('Error extracting session ID:', error);
+        console.error('❌ Error extracting session ID:', error);
         // Fallback: use timestamp as session ID
         const sessionId = Date.now().toString();
-        onGameCreated(sessionId, generatedRoomCode, maxPlayers);
+        registerGameWithBackend(sessionId);
       }
     }
-  }, [isSuccess, hash, generatedRoomCode, maxPlayers, onGameCreated, receipt]);
+  }, [isSuccess, hash, generatedRoomCode, maxPlayers, questionCount, timeLimit, account, onGameCreated, receipt]);
 
   React.useEffect(() => {
     if (error) {
